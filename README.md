@@ -52,7 +52,7 @@
 
 ## 🗺️ Roadmap
 
-* [ ] Integration with Pomodoro technique
+* [x] Integration with Pomodoro technique
 * [ ] Daily stats visualization (matplotlib)
 * [ ] Cross-platform "blocker" for distracting apps
 
