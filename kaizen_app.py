@@ -7,6 +7,7 @@ import time
 import threading
 import subprocess
 import webbrowser
+import json
 from pathlib import Path
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
@@ -31,8 +32,11 @@ FONTS = {
     "icon": ("Arial", 11, "bold")
 }
 
+CONFIG_FILE = Path.home() / ".kaizen_hud_config.json"
+
 class Config:
     def __init__(self):
+        # Default values
         self.watch_paths = [str(Path.home() / "Downloads")]
         self.monk_urls = [
             "https://www.kaggle.com",
@@ -50,6 +54,39 @@ class Config:
         self.pomo_work = 25
         self.pomo_break = 5
         self.autostart = False
+        
+        # Load from file on init
+        self.load()
+
+    def to_dict(self):
+        return {
+            "watch_paths": self.watch_paths,
+            "monk_urls": self.monk_urls,
+            "pomo_work": self.pomo_work,
+            "pomo_break": self.pomo_break,
+            "autostart": self.autostart
+        }
+
+    def save(self):
+        try:
+            with open(CONFIG_FILE, "w") as f:
+                json.dump(self.to_dict(), f, indent=4)
+        except Exception as e:
+            print(f"Config Save Error: {e}")
+
+    def load(self):
+        if CONFIG_FILE.exists():
+            try:
+                with open(CONFIG_FILE, "r") as f:
+                    data = json.load(f)
+                    # Update only existing keys to keep defaults safe
+                    if "watch_paths" in data: self.watch_paths = data["watch_paths"]
+                    if "monk_urls" in data: self.monk_urls = data["monk_urls"]
+                    if "pomo_work" in data: self.pomo_work = data.get("pomo_work", 25)
+                    if "pomo_break" in data: self.pomo_break = data.get("pomo_break", 5)
+                    if "autostart" in data: self.autostart = data.get("autostart", False)
+            except Exception as e:
+                print(f"Config Load Error: {e}")
 
 CONFIG = Config()
 
@@ -165,7 +202,7 @@ class AutomationService:
             self.observer.join()
             self._is_running = False
 
-# --- SETTINGS WINDOW (NON-BLOCKING) ---
+# --- SETTINGS WINDOW (NON-BLOCKING + PERSISTENCE) ---
 class SettingsWindow(tk.Toplevel):
     def __init__(self, parent, automator, refresh_callback):
         super().__init__(parent)
@@ -177,11 +214,9 @@ class SettingsWindow(tk.Toplevel):
         self.configure(bg=COLORS["bg"])
         self.attributes("-topmost", True)
         
-        # CLEANUP: Handle window close event to cleanup reference in main app
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         
         self._build_ui()
-        # REMOVED: self.grab_set() -> This was causing the "unusable app" issue
 
     def _build_ui(self):
         pad = 15
@@ -232,18 +267,21 @@ class SettingsWindow(tk.Toplevel):
             CONFIG.pomo_break = int(self.ent_break.get())
         except ValueError: pass
         
-        AutoStartManager.set_autostart(self.var_autostart.get())
+        CONFIG.autostart = self.var_autostart.get()
+        AutoStartManager.set_autostart(CONFIG.autostart)
+        
+        # Save to JSON file
+        CONFIG.save()
+        
         self.automator.start_watching()
         self.after(0, self._finish_save)
 
     def _finish_save(self):
         self.refresh_callback()
-        # CHANGED: Use non-blocking notification instead of MessageBox
-        self.master.show_notification("Settings Saved Successfully.")
+        self.master.show_notification("Settings Saved & Stored.")
         self.on_close()
 
     def on_close(self):
-        # Notify main app that we are closing so it can clear the reference
         self.master.settings_window_ref = None
         self.destroy()
 
@@ -297,7 +335,7 @@ class KaizenHUD(tk.Tk):
         self.pomo_state = "WORK"
         self.pomo_seconds_left = CONFIG.pomo_work * 60
         
-        self.settings_window_ref = None # Reference to prevent multiple windows
+        self.settings_window_ref = None
         
         self.run_preload()
         self._setup_window()
@@ -310,7 +348,7 @@ class KaizenHUD(tk.Tk):
 
     def run_preload(self):
         splash = SplashScreen(self)
-        steps = [(0.3, "Loading..."), (0.6, "System Check..."), (1.0, "Ready")]
+        steps = [(0.3, "Loading Config..."), (0.6, "System Check..."), (1.0, "Ready")]
         for p, t in steps:
             time.sleep(0.3)
             splash.update_progress(p, t)
@@ -368,7 +406,7 @@ class KaizenHUD(tk.Tk):
         if self.settings_window_ref is None or not self.settings_window_ref.winfo_exists():
             self.settings_window_ref = SettingsWindow(self, self.automator, self.reset_timer_config)
         else:
-            self.settings_window_ref.lift() # Bring existing window to front
+            self.settings_window_ref.lift()
 
     def reset_timer_config(self):
         self.pomo_active = False 
@@ -433,12 +471,17 @@ class KaizenHUD(tk.Tk):
     def show_notification(self, msg):
         self.after(0, lambda: CustomNotification(self, msg))
 
+    # --- MINIMIZATION FIX FOR LINUX ---
     def minimize_app(self):
+        # Unbind first to prevent conflict
+        self.unbind("<Map>")
         self.overrideredirect(False)
         self.iconify()
-        self.bind("<Map>", self.restore_borders)
+        # Bind restore event ONLY after minimizing
+        self.bind("<Map>", self.on_restore_from_min)
 
-    def restore_borders(self, event):
+    def on_restore_from_min(self, event):
+        # Check if state is normal (restored) and it's the root window
         if self.state() == "normal":
             self.overrideredirect(True)
             self.unbind("<Map>")
