@@ -1,4 +1,4 @@
-# KAIZEN HUD
+# KAIZEN HUD (not working atm)
 
 > "Efficiency is doing things right; effectiveness is doing the right things."
 
