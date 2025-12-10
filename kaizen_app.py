@@ -8,7 +8,10 @@ import threading
 import subprocess
 import webbrowser
 import json
+import queue
+import random
 from pathlib import Path
+from datetime import datetime
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
@@ -16,46 +19,54 @@ from watchdog.events import FileSystemEventHandler
 COLORS = {
     "bg": "#121212",
     "fg": "#E0E0E0",
-    "accent": "#8A56CC",    # PURPLE
-    "alert": "#FF5252",     # Red
-    "break": "#29B6F6",     # Blue
+    "accent": "#8A56CC",    # PURPLE (Royalty/Wisdom)
+    "alert": "#FF5252",     # RED (Urgency)
+    "break": "#29B6F6",     # BLUE (Calm)
     "panel": "#1E1E1E",
+    "success": "#00C853",   # GREEN (Growth)
     "hover": "#333333",
     "input": "#2C2C2C"
 }
 
 FONTS = {
-    "main": ("Arial", 9),
-    "bold": ("Arial", 9, "bold"),
-    "timer": ("Courier New", 16, "bold"),
-    "small": ("Arial", 8),
-    "icon": ("Arial", 11, "bold")
+    "main": ("Segoe UI", 9),
+    "bold": ("Segoe UI", 9, "bold"),
+    "timer": ("Consolas", 22, "bold"), # Larger, clearer timer
+    "small": ("Segoe UI", 8),
+    "icon": ("Segoe UI", 11, "bold")
 }
+
+QUOTES = [
+    "We suffer more often in imagination than in reality. – Seneca",
+    "Discipline is doing what you hate to do, but doing it like you love it.",
+    "Waste no more time arguing what a good man should be. Be one. – Aurelius",
+    "Focus on the process, not the outcome. – Kaizen",
+    "You have power over your mind - not outside events. – Aurelius"
+]
 
 CONFIG_FILE = Path.home() / ".kaizen_hud_config.json"
 
 class Config:
     def __init__(self):
-        # Default values
         self.watch_paths = [str(Path.home() / "Downloads")]
-        self.monk_urls = [
-            "https://www.kaggle.com",
-            "https://gemini.google.com",
-            "https://renshuu.org"
-        ]
+        self.monk_urls = ["https://github.com", "https://chatgpt.com"]
         self.extensions = {
             "Images": [".jpg", ".jpeg", ".png", ".webp", ".svg", ".gif"],
             "Documents": [".pdf", ".docx", ".txt", ".xlsx", ".csv", ".pptx", ".md"],
             "Archives": [".zip", ".rar", ".7z", ".tar", ".gz", ".iso"],
             "Code": [".py", ".ipynb", ".js", ".cpp", ".html", ".css", ".json", ".sql"],
-            "Media": [".mp3", ".wav", ".mp4", ".mkv", ".mov", ".avi"],
-            "Executables": [".exe", ".msi", ".AppImage", ".deb", ".rpm"]
+            "Media": [".mp3", ".wav", ".mp4", ".mkv"],
+            "Installers": [".exe", ".msi", ".AppImage", ".deb"]
         }
         self.pomo_work = 25
         self.pomo_break = 5
         self.autostart = False
-        
-        # Load from file on init
+        # ROI Stats
+        self.stats = {
+            "files_moved": 0,
+            "minutes_focused": 0,
+            "sessions_completed": 0
+        }
         self.load()
 
     def to_dict(self):
@@ -64,7 +75,8 @@ class Config:
             "monk_urls": self.monk_urls,
             "pomo_work": self.pomo_work,
             "pomo_break": self.pomo_break,
-            "autostart": self.autostart
+            "autostart": self.autostart,
+            "stats": self.stats
         }
 
     def save(self):
@@ -79,122 +91,48 @@ class Config:
             try:
                 with open(CONFIG_FILE, "r") as f:
                     data = json.load(f)
-                    # Update only existing keys to keep defaults safe
                     if "watch_paths" in data: self.watch_paths = data["watch_paths"]
                     if "monk_urls" in data: self.monk_urls = data["monk_urls"]
                     if "pomo_work" in data: self.pomo_work = data.get("pomo_work", 25)
                     if "pomo_break" in data: self.pomo_break = data.get("pomo_break", 5)
                     if "autostart" in data: self.autostart = data.get("autostart", False)
+                    if "stats" in data: self.stats = data.get("stats", self.stats)
             except Exception as e:
                 print(f"Config Load Error: {e}")
 
+    def increment_stat(self, key, value=1):
+        if key in self.stats:
+            self.stats[key] += value
+            self.save()
+
 CONFIG = Config()
 
-# --- UTILS ---
-class AutoStartManager:
-    @staticmethod
-    def set_autostart(enable: bool):
-        app_path = os.path.abspath(sys.argv[0])
-        system = sys.platform
-        try:
-            if system == "win32":
-                startup_folder = os.path.join(os.getenv("APPDATA"), r"Microsoft\Windows\Start Menu\Programs\Startup")
-                link_path = os.path.join(startup_folder, "KaizenHUD.bat")
-                if enable:
-                    with open(link_path, "w") as f:
-                        f.write(f'@echo off\nstart "" pythonw "{app_path}"')
-                else:
-                    if os.path.exists(link_path): os.remove(link_path)
-            elif system.startswith("linux"):
-                autostart_dir = Path.home() / ".config" / "autostart"
-                autostart_dir.mkdir(parents=True, exist_ok=True)
-                desktop_file = autostart_dir / "kaizen_hud.desktop"
-                if enable:
-                    content = f"""[Desktop Entry]
-Type=Application
-Name=KaizenHUD
-Exec=/usr/bin/python3 "{app_path}"
-X-GNOME-Autostart-enabled=true
-NoDisplay=false
-Hidden=false
-"""
-                    with open(desktop_file, "w") as f:
-                        f.write(content)
-                else:
-                    if desktop_file.exists(): desktop_file.unlink()
-            CONFIG.autostart = enable
-        except Exception as e:
-            print(f"Autostart Error: {e}")
-
-# --- BACKEND ---
-class BatchNotifier:
-    def __init__(self, callback):
-        self.callback = callback
-        self.files = []
-        self.timer = None
-        self.lock = threading.Lock()
-
-    def add_file(self, filename, category):
-        with self.lock:
-            self.files.append((filename, category))
-            if self.timer: self.timer.cancel()
-            self.timer = threading.Timer(1.5, self._flush)
-            self.timer.start()
-
-    def _flush(self):
-        with self.lock:
-            if not self.files: return
-            count = len(self.files)
-            first_file, cat = self.files[0]
-            msg = f"Moved: {first_file} -> [{cat}]" if count == 1 else f"Moved: {first_file} + {count-1} others -> [{cat}]"
-            self.callback(msg)
-            self.files = []
-
-class FileHandler(FileSystemEventHandler):
-    def __init__(self, batch_notifier):
-        self.notifier = batch_notifier
-
-    def on_created(self, event):
-        if event.is_directory: return
-        threading.Thread(target=self.process_file, args=(Path(event.src_path),)).start()
-
-    def process_file(self, file_path: Path):
-        time.sleep(1.0)
-        if not file_path.exists(): return
-        for category, exts in CONFIG.extensions.items():
-            if file_path.suffix.lower() in exts:
-                try:
-                    dest_dir = Path.home() / "Desktop" / category
-                    dest_dir.mkdir(parents=True, exist_ok=True)
-                    final_path = dest_dir / file_path.name
-                    counter = 1
-                    while final_path.exists():
-                        final_path = dest_dir / f"{file_path.stem}_{counter}{file_path.suffix}"
-                        counter += 1
-                    shutil.move(str(file_path), str(final_path))
-                    self.notifier.add_file(file_path.name, category)
-                    return
-                except Exception: pass
-
+# --- BACKEND (THREAD-SAFE) ---
 class AutomationService:
-    def __init__(self, notify_callback):
-        self.batcher = BatchNotifier(notify_callback)
-        self.handler = FileHandler(self.batcher)
+    def __init__(self, gui_queue):
+        self.gui_queue = gui_queue
         self.observer = None
         self._is_running = False
 
     def start_watching(self):
         if self._is_running: self.stop_watching()
         self.observer = Observer()
+        handler = FileHandler(self.gui_queue)
+        
         valid_paths = 0
         for path_str in CONFIG.watch_paths:
             path = Path(path_str)
             if path.exists() and path.is_dir():
-                self.observer.schedule(self.handler, str(path), recursive=False)
-                valid_paths += 1
+                try:
+                    self.observer.schedule(handler, str(path), recursive=False)
+                    valid_paths += 1
+                except Exception as e:
+                    print(f"Error scheduling {path}: {e}")
+        
         if valid_paths > 0:
             self.observer.start()
             self._is_running = True
+            print(f"Automation started on {valid_paths} paths.")
 
     def stop_watching(self):
         if self._is_running and self.observer:
@@ -202,64 +140,112 @@ class AutomationService:
             self.observer.join()
             self._is_running = False
 
-# --- SETTINGS WINDOW (NON-BLOCKING + PERSISTENCE) ---
+class FileHandler(FileSystemEventHandler):
+    def __init__(self, gui_queue):
+        self.gui_queue = gui_queue
+
+    def on_created(self, event):
+        if event.is_directory: return
+        # Ignore temp files from browsers
+        if event.src_path.endswith(('.crdownload', '.part', '.tmp', '.download')):
+            return
+        threading.Thread(target=self.process_file, args=(Path(event.src_path),)).start()
+
+    def process_file(self, file_path: Path):
+        # Wait for file unlock (simple retry logic)
+        retries = 5
+        while retries > 0:
+            try:
+                if not file_path.exists(): return
+                
+                # Check for open handle / size stability could be added here
+                # For now, just a slightly longer delay for the OS to release the handle
+                time.sleep(1.5) 
+                
+                # Categorize
+                moved = False
+                for category, exts in CONFIG.extensions.items():
+                    if file_path.suffix.lower() in exts:
+                        dest_dir = Path.home() / "Desktop" / category
+                        dest_dir.mkdir(parents=True, exist_ok=True)
+                        
+                        final_path = dest_dir / file_path.name
+                        counter = 1
+                        while final_path.exists():
+                            final_path = dest_dir / f"{file_path.stem}_{counter}{file_path.suffix}"
+                            counter += 1
+                        
+                        shutil.move(str(file_path), str(final_path))
+                        
+                        CONFIG.increment_stat("files_moved")
+                        self.gui_queue.put(("notify", f"Kaizen: Moved {file_path.name} -> {category}"))
+                        moved = True
+                        break
+                
+                if moved: break
+            except PermissionError:
+                retries -= 1
+                time.sleep(2)
+            except Exception as e:
+                print(f"Error processing file: {e}")
+                break
+
+# --- SETTINGS WINDOW ---
 class SettingsWindow(tk.Toplevel):
     def __init__(self, parent, automator, refresh_callback):
         super().__init__(parent)
         self.automator = automator
         self.refresh_callback = refresh_callback
-        
-        self.title("Config")
-        self.geometry("300x340") 
+        self.title("Kaizen Config")
         self.configure(bg=COLORS["bg"])
         self.attributes("-topmost", True)
-        
-        self.protocol("WM_DELETE_WINDOW", self.on_close)
-        
+        self.geometry("320x400")
         self._build_ui()
 
     def _build_ui(self):
-        pad = 15
+        pad = 12
         
-        tk.Label(self, text="PATHS (;)", bg=COLORS["bg"], fg="#888", font=FONTS["small"]).pack(anchor="w", padx=pad, pady=(pad, 2))
+        tk.Label(self, text="WATCH PATHS (;)", bg=COLORS["bg"], fg="#888", font=FONTS["small"]).pack(anchor="w", padx=pad, pady=(pad, 2))
         self.ent_paths = tk.Entry(self, bg=COLORS["input"], fg=COLORS["fg"], bd=1, relief="solid", insertbackground="white")
         self.ent_paths.insert(0, ";".join(CONFIG.watch_paths))
         self.ent_paths.pack(fill="x", padx=pad)
 
-        tk.Label(self, text="URLS (;)", bg=COLORS["bg"], fg="#888", font=FONTS["small"]).pack(anchor="w", padx=pad, pady=(10, 2))
+        tk.Label(self, text="MONK URLS (;)", bg=COLORS["bg"], fg="#888", font=FONTS["small"]).pack(anchor="w", padx=pad, pady=(10, 2))
         self.ent_urls = tk.Entry(self, bg=COLORS["input"], fg=COLORS["fg"], bd=1, relief="solid", insertbackground="white")
         self.ent_urls.insert(0, ";".join(CONFIG.monk_urls))
         self.ent_urls.pack(fill="x", padx=pad)
 
-        pomo_frame = tk.Frame(self, bg=COLORS["bg"])
-        pomo_frame.pack(fill="x", padx=pad, pady=10)
+        # Timer Settings
+        frame_timer = tk.Frame(self, bg=COLORS["bg"])
+        frame_timer.pack(fill="x", padx=pad, pady=10)
         
-        tk.Label(pomo_frame, text="WORK:", bg=COLORS["bg"], fg="#888", font=FONTS["small"]).pack(side="left")
-        self.ent_work = tk.Entry(pomo_frame, width=4, bg=COLORS["input"], fg=COLORS["fg"], bd=1, relief="solid", insertbackground="white")
+        tk.Label(frame_timer, text="WORK (m)", bg=COLORS["bg"], fg=COLORS["accent"], font=FONTS["small"]).grid(row=0, column=0, padx=5)
+        tk.Label(frame_timer, text="BREAK (m)", bg=COLORS["bg"], fg=COLORS["break"], font=FONTS["small"]).grid(row=0, column=1, padx=5)
+        
+        self.ent_work = tk.Entry(frame_timer, width=5, bg=COLORS["input"], fg=COLORS["fg"], insertbackground="white")
         self.ent_work.insert(0, str(CONFIG.pomo_work))
-        self.ent_work.pack(side="left", padx=5)
-
-        tk.Label(pomo_frame, text="BREAK:", bg=COLORS["bg"], fg="#888", font=FONTS["small"]).pack(side="left", padx=(10, 0))
-        self.ent_break = tk.Entry(pomo_frame, width=4, bg=COLORS["input"], fg=COLORS["fg"], bd=1, relief="solid", insertbackground="white")
+        self.ent_work.grid(row=1, column=0, padx=5)
+        
+        self.ent_break = tk.Entry(frame_timer, width=5, bg=COLORS["input"], fg=COLORS["fg"], insertbackground="white")
         self.ent_break.insert(0, str(CONFIG.pomo_break))
-        self.ent_break.pack(side="left", padx=5)
+        self.ent_break.grid(row=1, column=1, padx=5)
 
-        self.var_autostart = tk.BooleanVar(value=CONFIG.autostart)
-        cb = tk.Checkbutton(self, text="RUN ON STARTUP", variable=self.var_autostart, 
-                            bg=COLORS["bg"], fg=COLORS["accent"], selectcolor=COLORS["bg"], 
-                            activebackground=COLORS["bg"], activeforeground=COLORS["accent"],
-                            font=FONTS["small"])
-        cb.pack(anchor="w", padx=pad)
+        # Stats Display
+        tk.Label(self, text="--- ROI STATS ---", bg=COLORS["bg"], fg="#555", font=FONTS["small"]).pack(pady=(15, 5))
+        stats_frame = tk.Frame(self, bg=COLORS["panel"], padx=10, pady=10)
+        stats_frame.pack(fill="x", padx=pad)
+        
+        s_files = CONFIG.stats.get("files_moved", 0)
+        s_mins = CONFIG.stats.get("minutes_focused", 0)
+        
+        tk.Label(stats_frame, text=f"📂 Files Organized: {s_files}", bg=COLORS["panel"], fg=COLORS["fg"], font=FONTS["small"]).pack(anchor="w")
+        tk.Label(stats_frame, text=f"🧠 Focus Minutes: {s_mins}", bg=COLORS["panel"], fg=COLORS["fg"], font=FONTS["small"]).pack(anchor="w")
 
-        self.btn_save = tk.Button(self, text="SAVE", bg=COLORS["accent"], fg="black", font=FONTS["bold"], 
-                  command=self.save_async)
+        # Save
+        self.btn_save = tk.Button(self, text="APPLY CHANGES", bg=COLORS["accent"], fg="black", font=FONTS["bold"], command=self.save_config)
         self.btn_save.pack(side="bottom", fill="x", padx=pad, pady=pad)
 
-    def save_async(self):
-        self.btn_save.configure(text="SAVING...", state="disabled")
-        threading.Thread(target=self._save_logic, daemon=True).start()
-
-    def _save_logic(self):
+    def save_config(self):
         CONFIG.watch_paths = [p.strip() for p in self.ent_paths.get().split(";") if p.strip()]
         CONFIG.monk_urls = [u.strip() for u in self.ent_urls.get().split(";") if u.strip()]
         try:
@@ -267,225 +253,208 @@ class SettingsWindow(tk.Toplevel):
             CONFIG.pomo_break = int(self.ent_break.get())
         except ValueError: pass
         
-        CONFIG.autostart = self.var_autostart.get()
-        AutoStartManager.set_autostart(CONFIG.autostart)
-        
-        # Save to JSON file
         CONFIG.save()
-        
         self.automator.start_watching()
-        self.after(0, self._finish_save)
-
-    def _finish_save(self):
         self.refresh_callback()
-        self.master.show_notification("Settings Saved & Stored.")
-        self.on_close()
-
-    def on_close(self):
-        self.master.settings_window_ref = None
         self.destroy()
 
-# --- NOTIFICATION & SPLASH ---
+# --- NOTIFICATION ---
 class CustomNotification(tk.Toplevel):
-    def __init__(self, parent, message):
+    def __init__(self, parent, message, color=COLORS["accent"]):
         super().__init__(parent)
         self.overrideredirect(True)
         self.attributes("-topmost", True)
         self.configure(bg=COLORS["panel"])
+        
         ws = self.winfo_screenwidth()
         hs = self.winfo_screenheight()
-        self.geometry(f"320x60+{ws-340}+{hs-80}")
-        tk.Frame(self, bg=COLORS["accent"], width=4).pack(side="left", fill="y")
+        w, h = 320, 50
+        x = ws - w - 20
+        y = hs - h - 60
+        self.geometry(f"{w}x{h}+{x}+{y}")
+        
+        # Border strip
+        tk.Frame(self, bg=color, width=5).pack(side="left", fill="y")
+        
         tk.Label(self, text=message, bg=COLORS["panel"], fg=COLORS["fg"], 
-                 font=FONTS["small"], wraplength=300, justify="left").pack(side="left", padx=10)
+                 font=FONTS["small"], wraplength=300, justify="left").pack(side="left", padx=12)
+        
+        # Auto fade out
         self.after(4000, self.destroy)
 
-class SplashScreen(tk.Toplevel):
-    def __init__(self, parent):
-        super().__init__(parent)
-        self.overrideredirect(True)
-        self.configure(bg=COLORS["bg"])
-        w, h = 400, 150
-        ws = self.winfo_screenwidth()
-        hs = self.winfo_screenheight()
-        x = (ws - w) // 2
-        y = (hs - h) // 2
-        self.geometry(f"{w}x{h}+{x}+{y}")
-        tk.Label(self, text="KAIZEN SYSTEM", font=("Courier New", 20, "bold"), 
-                 bg=COLORS["bg"], fg=COLORS["fg"]).pack(pady=(30, 10))
-        self.status_lbl = tk.Label(self, text="Initializing...", font=FONTS["small"], bg=COLORS["bg"], fg="#888")
-        self.status_lbl.pack()
-        self.progress_frame = tk.Frame(self, height=3, bg="#333", width=300)
-        self.progress_frame.pack(pady=20)
-        self.progress_fill = tk.Frame(self.progress_frame, height=3, bg=COLORS["accent"], width=0)
-        self.progress_fill.place(x=0, y=0)
-
-    def update_progress(self, percent, text):
-        self.progress_fill.configure(width=300 * percent)
-        self.status_lbl.configure(text=text)
-        self.update()
-
-# --- MAIN CONTROLLER ---
+# --- MAIN HUD ---
 class KaizenHUD(tk.Tk):
     def __init__(self):
         super().__init__()
         self.withdraw()
-        self.automator = AutomationService(self.show_notification)
+        
+        # Queue for thread-safe GUI updates
+        self.gui_queue = queue.Queue()
+        self.automator = AutomationService(self.gui_queue)
+        
         self.pomo_active = False
-        self.pomo_state = "WORK"
+        self.pomo_state = "WORK" # WORK or BREAK
         self.pomo_seconds_left = CONFIG.pomo_work * 60
-        
         self.settings_window_ref = None
-        
-        self.run_preload()
+
         self._setup_window()
-        self._setup_titlebar()
         self._setup_dashboard()
         
+        # Start Automation
         self.automator.start_watching()
+        
+        # Start Queue Checker
+        self.check_queue()
+        
         self.deiconify()
-        self.focus_force()
-
-    def run_preload(self):
-        splash = SplashScreen(self)
-        steps = [(0.3, "Loading Config..."), (0.6, "System Check..."), (1.0, "Ready")]
-        for p, t in steps:
-            time.sleep(0.3)
-            splash.update_progress(p, t)
-        splash.destroy()
+        self.show_notification("Kaizen Systems Online.", COLORS["success"])
 
     def _setup_window(self):
         self.overrideredirect(True)
-        self.geometry("280x200")
+        self.geometry("260x180")
         self.configure(bg=COLORS["bg"], highlightthickness=1, highlightbackground=COLORS["panel"])
         self.attributes("-topmost", True)
+        
+        # Center on screen
         ws = self.winfo_screenwidth()
         hs = self.winfo_screenheight()
-        x = (ws - 280) // 2
-        y = (hs - 200) // 2
+        x = (ws - 260) // 2
+        y = (hs - 180) // 2
         self.geometry(f"+{x}+{y}")
 
-    def _setup_titlebar(self):
-        self.title_bar = tk.Frame(self, bg=COLORS["panel"], height=24)
-        self.title_bar.pack(fill="x", side="top")
-        self.title_bar.bind("<ButtonPress-1>", self.start_move)
-        self.title_bar.bind("<B1-Motion>", self.do_move)
-        tk.Label(self.title_bar, text=" KAIZEN :: HUD", bg=COLORS["panel"], fg="#666", font=FONTS["small"]).pack(side="left")
-        btn_close = tk.Label(self.title_bar, text=" X ", bg=COLORS["panel"], fg=COLORS["alert"], font=FONTS["icon"], cursor="hand2")
+        # Dragging logic
+        self.bind("<ButtonPress-1>", self.start_move)
+        self.bind("<B1-Motion>", self.do_move)
+
+    def _setup_dashboard(self):
+        # Header / Title Bar
+        header = tk.Frame(self, bg=COLORS["panel"], height=25)
+        header.pack(fill="x")
+        
+        tk.Label(header, text=" KAIZEN", bg=COLORS["panel"], fg=COLORS["accent"], font=FONTS["bold"]).pack(side="left")
+        
+        # Window Controls
+        btn_close = tk.Label(header, text=" × ", bg=COLORS["panel"], fg="#666", font=FONTS["bold"], cursor="hand2")
         btn_close.pack(side="right")
         btn_close.bind("<Button-1>", lambda e: self.quit_app())
-        btn_min = tk.Label(self.title_bar, text=" _ ", bg=COLORS["panel"], fg=COLORS["fg"], font=FONTS["icon"], cursor="hand2")
+        
+        btn_min = tk.Label(header, text=" - ", bg=COLORS["panel"], fg="#666", font=FONTS["bold"], cursor="hand2")
         btn_min.pack(side="right")
         btn_min.bind("<Button-1>", lambda e: self.minimize_app())
 
-    def _setup_dashboard(self):
+        # Main Content
         self.content = tk.Frame(self, bg=COLORS["bg"])
-        self.content.pack(fill="both", expand=True, padx=10, pady=5)
+        self.content.pack(fill="both", expand=True, padx=15, pady=10)
         
-        self.lbl_pomo_mode = tk.Label(self.content, text="READY", font=FONTS["bold"], bg=COLORS["bg"], fg="#666")
-        self.lbl_pomo_mode.pack(pady=(5,0))
+        self.lbl_status = tk.Label(self.content, text="READY", font=FONTS["bold"], bg=COLORS["bg"], fg="#555")
+        self.lbl_status.pack()
         
         self.lbl_timer = tk.Label(self.content, text="00:00", font=FONTS["timer"], bg=COLORS["bg"], fg=COLORS["fg"])
-        self.lbl_timer.pack(pady=(0, 5))
+        self.lbl_timer.pack(pady=2)
         
-        self.btn_monk = tk.Button(self.content, text="START MONK MODE", 
-                                  bg=COLORS["bg"], fg=COLORS["accent"], 
+        self.btn_action = tk.Button(self.content, text="INITIATE MONK MODE", 
+                                  bg=COLORS["panel"], fg=COLORS["accent"], 
                                   activebackground=COLORS["accent"], activeforeground="black",
-                                  bd=1, relief="solid", font=FONTS["bold"], cursor="hand2",
-                                  command=self.toggle_monk_mode)
-        self.btn_monk.pack(fill="x", pady=15)
+                                  bd=0, font=FONTS["bold"], cursor="hand2",
+                                  command=self.toggle_monk_mode, pady=5)
+        self.btn_action.pack(fill="x", pady=10)
         
-        footer = tk.Frame(self.content, bg=COLORS["bg"])
-        footer.pack(side="bottom", fill="x", pady=5)
-        tk.Label(footer, text="System Active", font=FONTS["small"], bg=COLORS["bg"], fg="#444").pack(side="left")
-        btn_set = tk.Label(footer, text="[SETTINGS]", bg=COLORS["bg"], fg=COLORS["accent"], font=FONTS["small"], cursor="hand2")
-        btn_set.pack(side="right")
-        btn_set.bind("<Button-1>", lambda e: self.open_settings())
+        # Footer
+        footer = tk.Label(self, text="[SETTINGS]", bg=COLORS["bg"], fg="#444", font=FONTS["small"], cursor="hand2")
+        footer.pack(side="bottom", pady=5)
+        footer.bind("<Button-1>", lambda e: self.open_settings())
 
-    def open_settings(self):
-        if self.settings_window_ref is None or not self.settings_window_ref.winfo_exists():
-            self.settings_window_ref = SettingsWindow(self, self.automator, self.reset_timer_config)
-        else:
-            self.settings_window_ref.lift()
-
-    def reset_timer_config(self):
-        self.pomo_active = False 
-        self.pomo_state = "WORK"
-        self.pomo_seconds_left = CONFIG.pomo_work * 60
-        self.update_ui_idle()
+    # --- LOGIC ---
+    def check_queue(self):
+        try:
+            while True:
+                msg_type, content = self.gui_queue.get_nowait()
+                if msg_type == "notify":
+                    self.show_notification(content)
+        except queue.Empty:
+            pass
+        self.after(100, self.check_queue)
 
     def toggle_monk_mode(self):
         if not self.pomo_active:
-            self.pomo_active = True
-            self.pomo_state = "WORK"
-            self.pomo_seconds_left = CONFIG.pomo_work * 60
-            self.run_monk_sequence()
-            self.pomo_tick()
+            self.start_monk_mode()
         else:
-            self.pomo_active = False
-            self.update_ui_idle()
+            self.stop_monk_mode()
 
-    def run_monk_sequence(self):
-        for url in CONFIG.monk_urls: webbrowser.open(url)
-        try: subprocess.Popen(["code"], shell=True) 
-        except: pass
+    def start_monk_mode(self):
+        self.pomo_active = True
+        self.pomo_state = "WORK"
+        self.pomo_seconds_left = CONFIG.pomo_work * 60
+        self.update_timer_display()
+        
+        # Kaizen Actions
+        quote = random.choice(QUOTES)
+        self.show_notification(quote, COLORS["accent"])
+        
+        # Launch tools
+        for url in CONFIG.monk_urls:
+            webbrowser.open(url)
+        
+        # Smart VS Code Launch
+        if shutil.which("code"):
+            subprocess.Popen(["code"], shell=True)
+        else:
+            print("VS Code not found in PATH")
 
-    def pomo_tick(self):
+        self.btn_action.configure(text="STOP SESSION", fg=COLORS["alert"])
+        self.tick_timer()
+
+    def stop_monk_mode(self):
+        self.pomo_active = False
+        self.btn_action.configure(text="INITIATE MONK MODE", fg=COLORS["accent"])
+        self.lbl_status.configure(text="READY", fg="#555")
+        self.lbl_timer.configure(text="00:00", fg=COLORS["fg"])
+
+    def tick_timer(self):
         if self.pomo_active:
             if self.pomo_seconds_left > 0:
                 self.pomo_seconds_left -= 1
-                self.update_ui_timer()
-                self.after(1000, self.pomo_tick)
+                
+                # ROI Tracking: Every minute of work counts
+                if self.pomo_state == "WORK" and self.pomo_seconds_left % 60 == 0:
+                    CONFIG.increment_stat("minutes_focused")
+                
+                self.update_timer_display()
+                self.after(1000, self.tick_timer)
             else:
-                self.switch_pomo_state()
+                self.switch_state()
 
-    def switch_pomo_state(self):
-        self.bell()
+    def switch_state(self):
+        self.bell() # System sound
         if self.pomo_state == "WORK":
-            self.show_notification("Focus complete! Take a break.")
+            CONFIG.increment_stat("sessions_completed")
+            self.show_notification("Focus Complete. Recover.", COLORS["success"])
             self.pomo_state = "BREAK"
             self.pomo_seconds_left = CONFIG.pomo_break * 60
         else:
-            self.show_notification("Break over. Back to work!")
+            self.show_notification("Break Over. Engage.", COLORS["alert"])
             self.pomo_state = "WORK"
             self.pomo_seconds_left = CONFIG.pomo_work * 60
-        self.pomo_tick()
+        self.tick_timer()
 
-    def update_ui_timer(self):
+    def update_timer_display(self):
         mins, secs = divmod(self.pomo_seconds_left, 60)
-        time_str = "{:02}:{:02}".format(mins, secs)
-        self.lbl_timer.configure(text=time_str)
+        self.lbl_timer.configure(text=f"{mins:02}:{secs:02}")
         if self.pomo_state == "WORK":
-            self.lbl_pomo_mode.configure(text="[ WORK FOCUS ]", fg=COLORS["accent"])
+            self.lbl_status.configure(text="/// DEEP WORK ///", fg=COLORS["accent"])
             self.lbl_timer.configure(fg=COLORS["accent"])
-            self.btn_monk.configure(text="STOP SESSION", fg=COLORS["alert"])
         else:
-            self.lbl_pomo_mode.configure(text="[ BREAK TIME ]", fg=COLORS["break"])
+            self.lbl_status.configure(text="/// RECOVERY ///", fg=COLORS["break"])
             self.lbl_timer.configure(fg=COLORS["break"])
 
-    def update_ui_idle(self):
-        self.lbl_pomo_mode.configure(text="READY", fg="#666")
-        self.lbl_timer.configure(text="00:00", fg=COLORS["fg"])
-        self.btn_monk.configure(text="START MONK MODE", fg=COLORS["accent"])
+    def show_notification(self, msg, color=COLORS["accent"]):
+        CustomNotification(self, msg, color)
 
-    def show_notification(self, msg):
-        self.after(0, lambda: CustomNotification(self, msg))
+    def open_settings(self):
+        if not self.settings_window_ref or not self.settings_window_ref.winfo_exists():
+            self.settings_window_ref = SettingsWindow(self, self.automator, lambda: None)
 
-    # --- MINIMIZATION FIX FOR LINUX ---
-    def minimize_app(self):
-        # Unbind first to prevent conflict
-        self.unbind("<Map>")
-        self.overrideredirect(False)
-        self.iconify()
-        # Bind restore event ONLY after minimizing
-        self.bind("<Map>", self.on_restore_from_min)
-
-    def on_restore_from_min(self, event):
-        # Check if state is normal (restored) and it's the root window
-        if self.state() == "normal":
-            self.overrideredirect(True)
-            self.unbind("<Map>")
-
+    # --- WINDOW OPS ---
     def start_move(self, event):
         self.x = event.x
         self.y = event.y
@@ -494,6 +463,17 @@ class KaizenHUD(tk.Tk):
         x = self.winfo_x() + (event.x - self.x)
         y = self.winfo_y() + (event.y - self.y)
         self.geometry(f"+{x}+{y}")
+
+    def minimize_app(self):
+        # Reliable minimization for borderless windows
+        self.overrideredirect(False) 
+        self.iconify()
+        self.bind("<Map>", self.on_restore)
+
+    def on_restore(self, event):
+        if self.state() == "normal":
+            self.overrideredirect(True)
+            self.unbind("<Map>")
 
     def quit_app(self):
         self.automator.stop_watching()
