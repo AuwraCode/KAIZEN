@@ -57,4 +57,4 @@
 * [ ] Cross-platform "blocker" for distracting apps
 
 ---
-*Built with discipline by Grzegorz Handzel.*
+*Built with discipline by Grzegorz Handzel (Auwra).*
